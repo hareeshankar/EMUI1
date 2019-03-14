@@ -1,0 +1,14 @@
+.App {
+  font-family: sans-serif;
+  text-align: center;
+}
+
+body {
+  margin: 0px;
+}
+.appbar {
+  text-align: "center";
+}
+.typo {
+  padding: 10px 10px 10px 10px;
+}
