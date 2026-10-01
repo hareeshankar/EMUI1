@@ -42,7 +42,9 @@ async function editPdf(bytes, rules, caseSensitive) {
   let count = 0;
 
   for (let p = 1; p <= doc.numPages; p++) {
-    const content = await (await doc.getPage(p)).getTextContent();
+    const srcPage = await doc.getPage(p);
+    const content = await srcPage.getTextContent();
+    const paint = await readPaint(srcPage, pdfjs.OPS);   // filled shapes and text colours, so the patch can match them
     const page = pages[p - 1];
     const items = content.items.filter(it => it.str && it.width > 0);
     for (const line of groupLines(items)) {
@@ -57,21 +59,26 @@ async function editPdf(bytes, rules, caseSensitive) {
         for (let i = 0; i < it.str.length; i++) { chars.push({ it, i }); text += it.str[i]; }
       });
       const hay = caseSensitive ? text : text.toLowerCase();
+      const done = [];   // character ranges already replaced on this line, so overlapping rules don't patch twice
       for (const { find, replace } of rules) {
         const needle = caseSensitive ? find : find.toLowerCase();
         let idx = hay.indexOf(needle);
         while (idx !== -1) {
-          const span = spanOf(chars, idx, idx + needle.length);
+          const overlaps = done.some(([a, b]) => idx < b && idx + needle.length > a);
+          const span = overlaps ? null : spanOf(chars, idx, idx + needle.length, font);
           if (span) {
+            done.push([idx, idx + needle.length]);
             const size = span.size;
-            page.drawRectangle({ x: span.x0 - 0.5, y: span.y - size * 0.25, width: span.x1 - span.x0 + 1, height: size * 1.2, color: rgb(1, 1, 1) });
+            const bg = backgroundAt(paint.fills, (span.x0 + span.x1) / 2, span.y + size * 0.35);
+            const fg = textColourAt(paint.texts, span.x0, span.y, size);
+            page.drawRectangle({ x: span.x0 - 0.5, y: span.y - size * 0.25, width: span.x1 - span.x0 + 1, height: size * 1.2, color: rgb(bg[0] / 255, bg[1] / 255, bg[2] / 255) });
             const txt = String(replace == null ? "" : replace);
             if (txt) {
               const safe = txt.replace(/[^\x20-\x7E\xA0-\xFF]/g, "?");   // WinAnsi only
               // shrink the font a little if the replacement is wider than the space it replaces
               let fs = size; const room = span.x1 - span.x0;
               while (fs > 4 && font.widthOfTextAtSize(safe, fs) > room + size * 0.6) fs -= 0.5;
-              page.drawText(safe, { x: span.x0, y: span.y, size: fs, font, color: rgb(0, 0, 0) });
+              page.drawText(safe, { x: span.x0, y: span.y, size: fs, font, color: rgb(fg[0] / 255, fg[1] / 255, fg[2] / 255) });
             }
             count++;
           }
@@ -81,6 +88,76 @@ async function editPdf(bytes, rules, caseSensitive) {
     }
   }
   return { bytes: await out.save(), count };
+}
+
+// Walk the page's drawing instructions and note (a) every filled shape with its colour and box, in paint order,
+// and (b) where each piece of text starts and what colour it was drawn in.
+async function readPaint(srcPage, OPS) {
+  const ol = await srcPage.getOperatorList();
+  const fills = [], texts = [];
+  let ctm = [1, 0, 0, 1, 0, 0], fill = [0, 0, 0], tm = [1, 0, 0, 1, 0, 0], pending = null;
+  const stack = [];
+  const mul = (m, n) => [m[0] * n[0] + m[1] * n[2], m[0] * n[1] + m[1] * n[3], m[2] * n[0] + m[3] * n[2], m[2] * n[1] + m[3] * n[3],
+    m[4] * n[0] + m[5] * n[2] + n[4], m[4] * n[1] + m[5] * n[3] + n[5]];
+  const pt = (m, x, y) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+  for (let i = 0; i < ol.fnArray.length; i++) {
+    const fn = ol.fnArray[i], a = ol.argsArray[i];
+    if (fn === OPS.save) stack.push({ ctm, fill });
+    else if (fn === OPS.restore) { const s = stack.pop(); if (s) { ctm = s.ctm; fill = s.fill; } }
+    else if (fn === OPS.transform) ctm = mul(a, ctm);
+    else if (fn === OPS.setFillRGBColor) fill = typeof a === "string" ? hexToRgb(a) : [a[0], a[1], a[2]];
+    else if (fn === OPS.constructPath) {
+      const mm = a[2];
+      if (mm && mm.length === 4 && isFinite(mm[0])) {
+        const c = [pt(ctm, mm[0], mm[1]), pt(ctm, mm[2], mm[3]), pt(ctm, mm[0], mm[3]), pt(ctm, mm[2], mm[1])];
+        pending = { x0: Math.min(...c.map(q => q[0])), y0: Math.min(...c.map(q => q[1])), x1: Math.max(...c.map(q => q[0])), y1: Math.max(...c.map(q => q[1])) };
+      } else pending = null;
+    }
+    else if (fn === OPS.fill || fn === OPS.eoFill || fn === OPS.fillStroke || fn === OPS.eoFillStroke) {
+      if (pending) fills.push({ ...pending, color: fill });
+      pending = null;
+    }
+    else if (fn === OPS.endPath || fn === OPS.stroke || fn === OPS.closeStroke) pending = null;
+    else if (fn === OPS.beginText) tm = [1, 0, 0, 1, 0, 0];
+    else if (fn === OPS.setTextMatrix) tm = a.slice ? Array.from(a) : a;
+    else if (fn === OPS.moveText) tm = [tm[0], tm[1], tm[2], tm[3], tm[0] * a[0] + tm[2] * a[1] + tm[4], tm[1] * a[0] + tm[3] * a[1] + tm[5]];
+    else if (fn === OPS.showText || fn === OPS.showSpacedText) {
+      const o = pt(mul(tm, ctm), 0, 0);
+      texts.push({ x: o[0], y: o[1], color: fill });
+    }
+  }
+  return { fills, texts };
+}
+
+// colour of the topmost filled shape under a point; white if nothing is painted there
+function backgroundAt(fills, x, y) {
+  for (let i = fills.length - 1; i >= 0; i--) {
+    const f = fills[i];
+    if (x >= f.x0 && x <= f.x1 && y >= f.y0 && y <= f.y1) return f.color;
+  }
+  return [255, 255, 255];
+}
+
+// colour of the text run that starts nearest to (left of) the match on the same baseline; black if unknown
+function textColourAt(texts, x, y, size) {
+  let best = null, bestDx = Infinity;
+  for (const t of texts) {
+    if (Math.abs(t.y - y) > size * 0.5) continue;
+    const dx = x - t.x;
+    if (dx >= -1 && dx < bestDx) { bestDx = dx; best = t; }
+  }
+  return best ? best.color : [0, 0, 0];
+}
+
+function hexToRgb(h) { const n = parseInt(h.replace("#", ""), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+
+function offsetIn(it, n, font) {
+  const safe = t => t.replace(/[^\x20-\x7E\xA0-\xFF]/g, "?");
+  try {
+    const whole = font.widthOfTextAtSize(safe(it.str), 10);
+    if (whole > 0) return it.width * font.widthOfTextAtSize(safe(it.str.slice(0, n)), 10) / whole;
+  } catch (e) { /* fall back to even spacing */ }
+  return charWidth(it) * n;
 }
 
 function charWidth(it) { return it.width / Math.max(1, it.str.length); }
@@ -98,11 +175,12 @@ function groupLines(items) {
 }
 
 // the box covered by characters [a, b) of a line: left edge of the first, right edge of the last
-function spanOf(chars, a, b) {
+// Character positions use proportional widths (a "1" is narrower than an "M"), scaled to the piece's real width.
+function spanOf(chars, a, b, font) {
   const first = chars.slice(a, b).find(c => c), last = chars.slice(a, b).reverse().find(c => c);
   if (!first || !last) return null;
-  const x0 = first.it.transform[4] + charWidth(first.it) * first.i;
-  const x1 = last.it.transform[4] + charWidth(last.it) * (last.i + 1);
+  const x0 = first.it.transform[4] + offsetIn(first.it, first.i, font);
+  const x1 = last.it.transform[4] + offsetIn(last.it, last.i + 1, font);
   const size = first.it.height || Math.abs(first.it.transform[3]) || 12;
   return { x0, x1, y: first.it.transform[5], size };
 }
