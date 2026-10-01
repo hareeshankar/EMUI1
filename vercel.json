@@ -1,3 +1,8 @@
 {
-  "functions": { "api/edit-pdf.js": { "maxDuration": 30 } }
+  "functions": {
+    "api/edit-pdf.js": {
+      "maxDuration": 30,
+      "includeFiles": "node_modules/pdfjs-dist/legacy/build/**"
+    }
+  }
 }
