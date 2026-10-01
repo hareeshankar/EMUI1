@@ -44,7 +44,8 @@ async function editPdf(bytes, rules, caseSensitive) {
   for (let p = 1; p <= doc.numPages; p++) {
     const srcPage = await doc.getPage(p);
     const content = await srcPage.getTextContent();
-    const paint = await readPaint(srcPage, pdfjs.OPS);   // filled shapes and text colours, so the patch can match them
+    const paint = await readPaint(srcPage, pdfjs.OPS);   // filled shapes, text colours and real glyph widths
+    font.realWidths = paint.widths;
     const page = pages[p - 1];
     const items = content.items.filter(it => it.str && it.width > 0);
     for (const line of groupLines(items)) {
@@ -75,13 +76,16 @@ async function editPdf(bytes, rules, caseSensitive) {
             const txt = String(replace == null ? "" : replace);
             const safe = txt.replace(/[^\x20-\x7E\xA0-\xFF]/g, "?");   // WinAnsi only
             // room for the new text: up to the next piece of text on the line, or the edge of the cell it sits in
-            let limit = nextTextX(chars, idx + needle.length, font);
+            let limit = nextTextX(chars, idx + needle.length, font) - size * 0.15;
             if (shape) limit = Math.min(limit, shape.x1 - 0.5);
             let fs = size;
             while (fs > 4 && safe && font.widthOfTextAtSize(safe, fs) > limit - span.x0) fs -= 0.5;
             const tw = safe ? font.widthOfTextAtSize(safe, fs) : 0;
             // the patch covers the old text and the new text, and never goes beyond the shape it sits on
             let r = { x0: span.x0 - 0.5, x1: Math.max(span.x1, span.x0 + tw) + 0.5, y0: span.y - size * 0.25, y1: span.y + size * 0.95 };
+            // never paint over the neighbouring text on the line, however close it is
+            const prevEnd = prevTextX(chars, idx, font), nextStart = nextTextX(chars, idx + needle.length, font);
+            r.x0 = Math.max(r.x0, prevEnd + 0.2); r.x1 = Math.min(r.x1, nextStart - 0.2);
             if (shape) r = { x0: Math.max(r.x0, shape.x0), x1: Math.min(r.x1, shape.x1), y0: Math.max(r.y0, shape.y0), y1: Math.min(r.y1, shape.y1) };
             if (r.x1 > r.x0 && r.y1 > r.y0) page.drawRectangle({ x: r.x0, y: r.y0, width: r.x1 - r.x0, height: r.y1 - r.y0, color: rgb(bg[0] / 255, bg[1] / 255, bg[2] / 255) });
             if (safe) page.drawText(safe, { x: span.x0, y: span.y, size: fs, font, color: rgb(fg[0] / 255, fg[1] / 255, fg[2] / 255) });
@@ -99,8 +103,9 @@ async function editPdf(bytes, rules, caseSensitive) {
 // and (b) where each piece of text starts and what colour it was drawn in.
 async function readPaint(srcPage, OPS) {
   const ol = await srcPage.getOperatorList();
-  const fills = [], texts = [];
-  let ctm = [1, 0, 0, 1, 0, 0], fill = [0, 0, 0], tm = [1, 0, 0, 1, 0, 0], pending = null;
+  const fills = [], texts = [], widths = {};   // widths[fontName][char] = glyph width in 1/1000 em, from the document's own font
+  let ctm = [1, 0, 0, 1, 0, 0], fill = [0, 0, 0], tm = [1, 0, 0, 1, 0, 0], pending = null, fontName = "";
+  const noteGlyphs = (arr) => { const w = widths[fontName] || (widths[fontName] = {}); for (const g of arr || []) if (g && typeof g === "object" && g.unicode != null && typeof g.width === "number") { for (const ch of g.unicode) if (w[ch] == null) w[ch] = g.width; } };
   const stack = [];
   const mul = (m, n) => [m[0] * n[0] + m[1] * n[2], m[0] * n[1] + m[1] * n[3], m[2] * n[0] + m[3] * n[2], m[2] * n[1] + m[3] * n[3],
     m[4] * n[0] + m[5] * n[2] + n[4], m[4] * n[1] + m[5] * n[3] + n[5]];
@@ -126,12 +131,14 @@ async function readPaint(srcPage, OPS) {
     else if (fn === OPS.beginText) tm = [1, 0, 0, 1, 0, 0];
     else if (fn === OPS.setTextMatrix) tm = a.slice ? Array.from(a) : a;
     else if (fn === OPS.moveText) tm = [tm[0], tm[1], tm[2], tm[3], tm[0] * a[0] + tm[2] * a[1] + tm[4], tm[1] * a[0] + tm[3] * a[1] + tm[5]];
+    else if (fn === OPS.setFont) fontName = a[0];
     else if (fn === OPS.showText || fn === OPS.showSpacedText) {
       const o = pt(mul(tm, ctm), 0, 0);
       texts.push({ x: o[0], y: o[1], color: fill });
+      noteGlyphs(a[0]);
     }
   }
-  return { fills, texts };
+  return { fills, texts, widths };
 }
 
 // the topmost filled shape under a point (its box and colour); null if nothing is painted there
@@ -148,9 +155,19 @@ function nextTextX(chars, b, font) {
   for (let i = b; i < chars.length; i++) {
     const c = chars[i]; if (!c) continue;
     if (c.it.str[c.i] === " ") continue;
-    return c.it.transform[4] + offsetIn(c.it, c.i, font) - charWidth(c.it) * 0.3;
+    return c.it.transform[4] + offsetIn(c.it, c.i, font);
   }
   return Infinity;
+}
+
+// where the previous piece of text before character index a ends on this line (-Infinity if the match starts the line)
+function prevTextX(chars, a, font) {
+  for (let i = a - 1; i >= 0; i--) {
+    const c = chars[i]; if (!c) continue;
+    if (c.it.str[c.i] === " ") continue;
+    return c.it.transform[4] + offsetIn(c.it, c.i + 1, font);
+  }
+  return -Infinity;
 }
 
 // colour of the text run that starts nearest to (left of) the match on the same baseline; black if unknown
@@ -166,12 +183,18 @@ function textColourAt(texts, x, y, size) {
 
 function hexToRgb(h) { const n = parseInt(h.replace("#", ""), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
 
+// distance from the start of a piece to its n-th character, measured with the document's real glyph widths when
+// the page's own font supplied them, otherwise with Helvetica, scaled to the piece's true width
 function offsetIn(it, n, font) {
   const safe = t => t.replace(/[^\x20-\x7E\xA0-\xFF]/g, "?");
-  try {
-    const whole = font.widthOfTextAtSize(safe(it.str), 10);
-    if (whole > 0) return it.width * font.widthOfTextAtSize(safe(it.str.slice(0, n)), 10) / whole;
-  } catch (e) { /* fall back to even spacing */ }
+  const table = font.realWidths && font.realWidths[it.fontName];
+  const w = (ch) => {
+    if (table && table[ch] != null) return table[ch] / 1000;
+    try { return font.widthOfTextAtSize(safe(ch), 1); } catch (e) { return 0.5; }
+  };
+  let whole = 0, part = 0;
+  for (let i = 0; i < it.str.length; i++) { const x = w(it.str[i]); whole += x; if (i < n) part += x; }
+  if (whole > 0) return it.width * part / whole;
   return charWidth(it) * n;
 }
 
