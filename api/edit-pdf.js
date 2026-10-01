@@ -20,6 +20,8 @@ module.exports = async function handler(req, res) {
     const bytes = Buffer.from(pdf, "base64");
     // pdfjs-dist ships ESM-only in newer versions, so load it dynamically.
     const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    // On Vercel the worker file must be bundled explicitly (see vercel.json includeFiles) and pointed at by path.
+    pdfjs.GlobalWorkerOptions.workerSrc = require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs");
     const doc = await pdfjs.getDocument({
       data: new Uint8Array(bytes),
       useSystemFonts: true,
