@@ -1,0 +1,3 @@
+{
+  "functions": { "api/edit-pdf.js": { "maxDuration": 30 } }
+}
