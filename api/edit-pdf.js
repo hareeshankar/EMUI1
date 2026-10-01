@@ -69,17 +69,22 @@ async function editPdf(bytes, rules, caseSensitive) {
           if (span) {
             done.push([idx, idx + needle.length]);
             const size = span.size;
-            const bg = backgroundAt(paint.fills, (span.x0 + span.x1) / 2, span.y + size * 0.35);
+            const shape = shapeAt(paint.fills, (span.x0 + span.x1) / 2, span.y + size * 0.35);
+            const bg = shape ? shape.color : [255, 255, 255];
             const fg = textColourAt(paint.texts, span.x0, span.y, size);
-            page.drawRectangle({ x: span.x0 - 0.5, y: span.y - size * 0.25, width: span.x1 - span.x0 + 1, height: size * 1.2, color: rgb(bg[0] / 255, bg[1] / 255, bg[2] / 255) });
             const txt = String(replace == null ? "" : replace);
-            if (txt) {
-              const safe = txt.replace(/[^\x20-\x7E\xA0-\xFF]/g, "?");   // WinAnsi only
-              // shrink the font a little if the replacement is wider than the space it replaces
-              let fs = size; const room = span.x1 - span.x0;
-              while (fs > 4 && font.widthOfTextAtSize(safe, fs) > room + size * 0.6) fs -= 0.5;
-              page.drawText(safe, { x: span.x0, y: span.y, size: fs, font, color: rgb(fg[0] / 255, fg[1] / 255, fg[2] / 255) });
-            }
+            const safe = txt.replace(/[^\x20-\x7E\xA0-\xFF]/g, "?");   // WinAnsi only
+            // room for the new text: up to the next piece of text on the line, or the edge of the cell it sits in
+            let limit = nextTextX(chars, idx + needle.length, font);
+            if (shape) limit = Math.min(limit, shape.x1 - 0.5);
+            let fs = size;
+            while (fs > 4 && safe && font.widthOfTextAtSize(safe, fs) > limit - span.x0) fs -= 0.5;
+            const tw = safe ? font.widthOfTextAtSize(safe, fs) : 0;
+            // the patch covers the old text and the new text, and never goes beyond the shape it sits on
+            let r = { x0: span.x0 - 0.5, x1: Math.max(span.x1, span.x0 + tw) + 0.5, y0: span.y - size * 0.25, y1: span.y + size * 0.95 };
+            if (shape) r = { x0: Math.max(r.x0, shape.x0), x1: Math.min(r.x1, shape.x1), y0: Math.max(r.y0, shape.y0), y1: Math.min(r.y1, shape.y1) };
+            if (r.x1 > r.x0 && r.y1 > r.y0) page.drawRectangle({ x: r.x0, y: r.y0, width: r.x1 - r.x0, height: r.y1 - r.y0, color: rgb(bg[0] / 255, bg[1] / 255, bg[2] / 255) });
+            if (safe) page.drawText(safe, { x: span.x0, y: span.y, size: fs, font, color: rgb(fg[0] / 255, fg[1] / 255, fg[2] / 255) });
             count++;
           }
           idx = hay.indexOf(needle, idx + needle.length);
@@ -129,13 +134,23 @@ async function readPaint(srcPage, OPS) {
   return { fills, texts };
 }
 
-// colour of the topmost filled shape under a point; white if nothing is painted there
-function backgroundAt(fills, x, y) {
+// the topmost filled shape under a point (its box and colour); null if nothing is painted there
+function shapeAt(fills, x, y) {
   for (let i = fills.length - 1; i >= 0; i--) {
     const f = fills[i];
-    if (x >= f.x0 && x <= f.x1 && y >= f.y0 && y <= f.y1) return f.color;
+    if (x >= f.x0 && x <= f.x1 && y >= f.y0 && y <= f.y1) return f;
   }
-  return [255, 255, 255];
+  return null;
+}
+
+// where the next piece of text after character index b begins on this line (Infinity if the match ends the line)
+function nextTextX(chars, b, font) {
+  for (let i = b; i < chars.length; i++) {
+    const c = chars[i]; if (!c) continue;
+    if (c.it.str[c.i] === " ") continue;
+    return c.it.transform[4] + offsetIn(c.it, c.i, font) - charWidth(c.it) * 0.3;
+  }
+  return Infinity;
 }
 
 // colour of the text run that starts nearest to (left of) the match on the same baseline; black if unknown
